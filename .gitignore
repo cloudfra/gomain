@@ -80,6 +80,7 @@ bazel-testlogs
 # Editor/IDE
 .claude/
 .idea/
+.qwen/
 .vscode/
 
 # Output Directories
@@ -87,6 +88,6 @@ build/
 output/
 
 # Sensitive files
-/web.cert
-/web.key
+web.cert
+web.key
 gha-creds-*.json
