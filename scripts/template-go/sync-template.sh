@@ -28,22 +28,33 @@
 # with the upstream equivalents. Files upstream no longer ships are deleted,
 # files it now ships are added, and shared files are overwritten.
 #
-# The release artifact list in .github/workflows/deploy.yaml ("Create Release")
-# names the template's exampleapp binary. After the sync it is regenerated from
-# ALL_APPS in the target's root Makefile: every build/release/exampleapp-*
-# line is repeated once per app with exampleapp replaced by that app's name.
+# Nothing is deleted inside those two directories beyond the wholesale
+# replacement. A project customizes what lives in there, so a file that stops
+# shipping upstream is removed by name in RETIRED below instead: when the
+# template retires a workflow, its paths get listed here so every consumer
+# drops it and the sync says which file went away.
+#
+# That includes .github/workflows/create-release.yaml, the tag-triggered
+# release pipeline. Its release files are globs (build/release/*-linux_amd64
+# and so on) that match every app in ALL_APPS, so it needs no per-project
+# edits after the sync.
 #
 # Every other file directly under scripts/ (e.g. the CI hooks prepare-ci.sh
-# and Initialize-CI.ps1), plus a few root dotfiles (.codespellignore and
-# .gitignore), is the exception: it is copied in only when the target does not
-# already have one and is never overwritten, because the whole point of those
-# is to be customized. A project can edit them freely and
-# re-running the sync keeps its version.
+# and Initialize-CI.ps1), plus AGENTS.md and a few root dotfiles
+# (.codespellignore and .gitignore), is the exception: it is copied in only
+# when the target does not already have one and is never overwritten, because
+# the whole point of those is to be customized. A project can edit them freely
+# and re-running the sync keeps its version.
 #
 # This is a HARD replace: local edits to any of the managed files are
 # discarded and project-specific versions (e.g. a customized .golangci.yml) are
 # clobbered. Prefer running it on a branch/PR, or with --dry-run first, so the
 # change is reviewable.
+#
+# Nothing runs it for you: the template ships no workflow that syncs on a
+# schedule, because reviewing a hard replace needs a pull request and a
+# scheduled job can only open one with a long-lived token handed to a
+# third-party action. Run it from a branch and open the pull request yourself.
 #
 # Usage: scripts/template-go/sync-template.sh [options]
 #
@@ -60,9 +71,24 @@ SCRIPT_SOURCE_REF="main"
 STANDARD_DIR="scripts/template-go"
 # Everything directly under here (outside STANDARD_DIR) is customizable.
 SEED_DIR="scripts"
-# Root dotfiles that are seeded like SEED_DIR rather than replaced like the
-# other root dotfiles.
-SEED_ROOT_FILES=(".codespellignore" ".gitignore")
+# Root files that are seeded like SEED_DIR rather than replaced like the
+# other managed files: a project is expected to customize them, so the sync
+# only copies them in when missing.
+SEED_ROOT_FILES=(".codespellignore" ".gitignore" "AGENTS.md")
+
+# Files the template has retired, deleted from the target by name. Listed one
+# by one rather than worked out from the replaced directories: a project
+# customizes what lives inside .github/ and scripts/template-go/, so the sync
+# removes nothing in there beyond the replacement it already makes. Add the
+# paths of a workflow (and any file that existed only for it) when the
+# template stops shipping it.
+RETIRED=(
+  ".github/dependency-update-pr-body.md"
+  ".github/template-sync-pr-body.md"
+  ".github/workflows/dependency-update.yaml"
+  ".github/workflows/template-sync.yaml"
+  "scripts/template-go/existing-pathspecs.sh"
+)
 
 # --- argument parsing -------------------------------------------------------
 
@@ -74,8 +100,10 @@ Sync template-managed files (Makefile_*.mk, root dotfiles, .github/,
 scripts/template-go/) from upstream template-go into the target project. This
 is a hard replace and is safe to re-run. .github/workflows/deploy-*.yaml are
 preserved, and the other files directly under scripts/ (e.g.
-scripts/prepare-ci.sh, scripts/Initialize-CI.ps1), .codespellignore and
-.gitignore are added only when missing and never overwritten.
+scripts/prepare-ci.sh, scripts/Initialize-CI.ps1), AGENTS.md,
+.codespellignore and .gitignore are added only when missing and never
+overwritten. A file the template no longer ships - a retired workflow, for
+example - is deleted and reported by name.
 
 Options:
   -s, --source DIR   Read upstream files from local DIR instead of cloning
@@ -327,98 +355,11 @@ for f in "${SOURCE_FILES[@]}"; do
   fi
 done
 
-# --- release artifacts ------------------------------------------------------
-
-DEPLOY_WORKFLOW=".github/workflows/deploy.yaml"
-
-# read_all_apps MAKEFILE prints the words of the ALL_APPS assignment(s) in
-# MAKEFILE, one per line. It understands =, :=, ::=, ?=, += and backslash
-# continuation lines, and drops trailing # comments.
-read_all_apps() {
-  awk '
-    function add(s) { sub(/#.*/, "", s); apps = apps " " s }
-    cont { s = $0; cont = sub(/\\[[:space:]]*$/, "", s); if (!skip) add(s); next }
-    /^[[:space:]]*(override[[:space:]]+)?ALL_APPS[[:space:]]*(:|::|:::|\?|\+)?=/ {
-      s = $0
-      op = s
-      sub(/=.*/, "", op)
-      sub(/^[^=]*=/, "", s)
-      cont = sub(/\\[[:space:]]*$/, "", s)
-      # ?= only assigns when ALL_APPS is still empty.
-      skip = (op ~ /\?$/ && apps ~ /[^[:space:]]/)
-      if (skip) next
-      if (op !~ /\+$/) apps = ""
-      add(s)
-      next
-    }
-    END {
-      n = split(apps, a, /[[:space:]]+/)
-      for (i = 1; i <= n; i++) if (a[i] != "") print a[i]
-    }
-  ' "$1"
-}
-
-# rewrite_release_files FILE APP... rewrites the "Create Release" step of the
-# workflow FILE in place: each run of build/release/exampleapp-* lines is
-# replaced by the same run repeated once per APP, with exampleapp swapped for
-# that APP.
-rewrite_release_files() {
-  local file="$1" tmp="$SYNC_TMP/deploy.yaml"
-  shift
-  awk -v apps="$*" '
-    BEGIN { napps = split(apps, app, " ") }
-    function flush(   i, j, l) {
-      for (i = 1; i <= napps; i++) {
-        for (j = 1; j <= nbuf; j++) {
-          l = buf[j]
-          sub(/build\/release\/exampleapp-/, "build/release/" app[i] "-", l)
-          print l
-        }
-      }
-      nbuf = 0
-    }
-    /^[[:space:]]*-[[:space:]]+name:/ {
-      if (nbuf) flush()
-      in_release = ($0 ~ /^[[:space:]]*-[[:space:]]+name:[[:space:]]*"?Create Release"?[[:space:]]*$/)
-    }
-    in_release && /^[[:space:]]*build\/release\/exampleapp-/ { buf[++nbuf] = $0; next }
-    { if (nbuf) flush(); print }
-    END { if (nbuf) flush() }
-  ' "$file" >"$tmp"
-  # Write through the existing file so its mode is kept.
-  cat -- "$tmp" >"$file"
-}
-
-APPS=()
-if [[ -f "$SOURCE/$DEPLOY_WORKFLOW" ]]; then
-  if [[ -f "$TARGET/Makefile" ]]; then
-    while IFS= read -r app; do
-      # Only plain names can be substituted; a $(VAR) reference can't be
-      # resolved without evaluating the whole makefile.
-      if [[ "$app" =~ ^[A-Za-z0-9._-]+$ ]]; then
-        APPS+=("$app")
-      else
-        echo "Warning: skipping ALL_APPS entry '$app' (not a plain binary name)." >&2
-      fi
-    done < <(read_all_apps "$TARGET/Makefile")
-  fi
-  if (( ${#APPS[@]} == 0 )); then
-    echo "Warning: no ALL_APPS found in $TARGET/Makefile; $DEPLOY_WORKFLOW keeps the template's exampleapp release files." >&2
-  fi
-fi
-
 # --- apply (or dry-run) -----------------------------------------------------
 
 # act ACTION LABEL prints the label under --dry-run; otherwise performs it.
 act() {
   local action="$1" label="$2"
-  if [[ "$action" == rewrite ]]; then
-    printf '  %-7s %s (release files for: %s)\n' "$action" "$label" "${APPS[*]}"
-    if [[ "$DRY_RUN" != true ]]; then
-      rewrite_release_files "$TARGET/$label" "${APPS[@]}"
-    fi
-    return 0
-  fi
   if [[ "$DRY_RUN" == true ]]; then
     printf '  %-7s %s\n' "$action" "$label"
     return 0
@@ -450,6 +391,20 @@ act() {
       cp -a -- "$SOURCE/$label" "$TARGET/$label"
       ;;
   esac
+}
+
+# delete_retired_files removes the RETIRED paths from the target, by name and
+# before the wholesale replacements. Under --dry-run act prints them; in a
+# real run this prints them, so a project always sees which file the template
+# took away instead of finding it in a diff afterwards.
+delete_retired_files() {
+  local f
+  for f in "${RETIRED[@]}"; do
+    if [[ -e "$TARGET/$f" ]]; then
+      [[ "$DRY_RUN" == true ]] || printf '  %-7s %s\n' delete "$f"
+      act delete "$f"
+    fi
+  done
 }
 
 # stash_preserved / restore_preserved carry PRESERVE across the .github/
@@ -491,6 +446,7 @@ done
 for f in ${KEEP[@]+"${KEEP[@]}"}; do
   act keep "$f"
 done
+delete_retired_files
 if (( S_HAS_STANDARD )); then
   act replace "$STANDARD_DIR"
 elif (( T_HAS_STANDARD )); then
@@ -503,9 +459,6 @@ elif (( T_HAS_GITHUB )); then
   act delete ".github"
 fi
 restore_preserved
-if [[ -f "$SOURCE/$DEPLOY_WORKFLOW" ]] && (( ${#APPS[@]} > 0 )); then
-  act rewrite "$DEPLOY_WORKFLOW"
-fi
 echo
 
 echo "Done."
